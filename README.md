@@ -2,9 +2,9 @@
 
 > [!WARNING]
 > This project was developed with the assistance of AI. Review all code before
-> using it. The script creates and overwrites launcher and icon files in your
-> home directory, and `-d` deletes an instance's Chrome data directory — its
-> logins, history and settings — after asking for confirmation.
+> using it. `chrome-instance` creates and overwrites launcher and icon files in
+> your home directory, and `-d` deletes an instance's Chrome data directory —
+> its logins, history and settings — after asking for confirmation.
 
 Run separate Google Chrome instances as their own desktop apps. Each instance
 gets its own launcher (`.desktop` file), data directory, process, logins, and
@@ -14,6 +14,22 @@ dock icon — optionally colored to match that Chrome's theme — without copyin
 Chrome's profiles share one instance; this gives each its own.
 
 Not affiliated with or endorsed by Google.
+
+## Contents
+
+- [Why](#why)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+- [What it creates](#what-it-creates)
+- [Web apps (PWAs)](#web-apps-pwas)
+- [Icons](#icons)
+- [Deleting](#deleting)
+- [Menu refresh](#menu-refresh)
+- [Upgrade and uninstall](#upgrade-and-uninstall)
+- [Development](#development)
+- [TODO](#todo)
 
 ## Why
 
@@ -32,27 +48,95 @@ sign in. Nothing is copied from your main Chrome config. Each data directory can
 still hold multiple Chrome profiles of its own if you add them from inside that
 launcher's Chrome.
 
+## Requirements
+
+- Linux with a freedesktop.org desktop. Built for GNOME on Wayland (tested with
+  the stock dock and Dash to Panel); the launchers are standard `.desktop`
+  files and work on other desktops too. See [Web apps](#web-apps-pwas) for the
+  one X11 limitation.
+- Google Chrome from Google's `.deb`/`.rpm` package, which installs
+  `/usr/bin/google-chrome-stable` and the logo
+  `/opt/google/chrome/product_logo_256.png`. For a different location, set
+  `CHROME_BIN` and `CHROME_LOGO` (see [Usage](#usage)).
+- Python 3.9 or later, which every current major distribution ships.
+- [pipx] (recommended) or Python's `venv` module, to install the package and
+  its two Python dependencies in their own environment, separate from the
+  system's Python packages:
+  - [materialyoucolor] — Google's Material color library, which Chrome also
+    uses to derive its colors from a theme color
+  - [Pillow] — image loading and drawing
+- Optional: `update-desktop-database` (package `desktop-file-utils`, installed
+  on most desktops), to refresh the "Open With" menus.
+
+[pipx]: https://pipx.pypa.io/
+[materialyoucolor]: https://pypi.org/project/materialyoucolor/
+[Pillow]: https://pypi.org/project/pillow/
+
 ## Install
 
+### With pipx (recommended)
+
+1. Install pipx from your distribution:
+
+   | Distribution | Command |
+   |---|---|
+   | Debian, Ubuntu, Mint, Pop!_OS | `sudo apt install pipx` |
+   | Fedora | `sudo dnf install pipx` |
+   | Arch, Manjaro | `sudo pacman -S python-pipx` |
+   | openSUSE | `sudo zypper install python313-pipx` (match the number to `python3 --version`; `zypper search pipx` lists them) |
+   | AlmaLinux, Rocky | `sudo dnf install epel-release && sudo dnf install pipx` |
+   | RHEL | [enable EPEL](https://docs.fedoraproject.org/en-US/epel/), then `sudo dnf install pipx` |
+
+2. Make sure `~/.local/bin`, where pipx puts commands, is on your `PATH`
+   (this changes your shell's startup file only if needed; open a new
+   terminal afterwards):
+
+   ```bash
+   pipx ensurepath
+   ```
+
+3. Install chrome-instance, straight from GitHub:
+
+   ```bash
+   pipx install git+https://github.com/matthewlenz/chrome-instance.git
+   ```
+
+   or from a local clone:
+
+   ```bash
+   git clone https://github.com/matthewlenz/chrome-instance.git
+   cd chrome-instance
+   pipx install .
+   ```
+
+4. Check that it works:
+
+   ```bash
+   chrome-instance --help
+   ```
+
+On RHEL 9 and its rebuilds, whose `python3` is 3.9, install Python 3.11 too
+(`sudo dnf install python3.11`) and add `--python python3.11` to the
+`pipx install` command, so the dependencies install from prebuilt packages
+instead of being compiled.
+
+### Without pipx
+
+pipx only automates the following: a virtual environment for the package and
+a link to its command. To do it by hand (on Debian and Ubuntu, first
+`sudo apt install python3-venv`):
+
 ```bash
-install -m755 chrome-instance ~/.local/bin/
+git clone https://github.com/matthewlenz/chrome-instance.git
+cd chrome-instance
+python3 -m venv ~/.local/share/chrome-instance/venv
+~/.local/share/chrome-instance/venv/bin/pip install .
+mkdir -p ~/.local/bin
+ln -s ~/.local/share/chrome-instance/venv/bin/chrome-instance ~/.local/bin/
 ```
 
-`~/.local/bin` must be on your `PATH`.
-
-Requirements:
-
-- Google Chrome at `/usr/bin/google-chrome-stable` (logo taken from
-  `/opt/google/chrome/product_logo_256.png`); override with `CHROME_BIN` and
-  `CHROME_LOGO`
-- For theme-colored icons (`--recolor`): `python3` and ImageMagick
-  (`convert` or `magick`). Not needed otherwise; ImageMagick is also used, when
-  present, to convert `--icon` images to PNG.
-- `update-desktop-database` (from `desktop-file-utils`), optional
-
-Built for GNOME on Wayland (tested with the stock dock and Dash to Panel). The
-launchers are standard `.desktop` files and work on other desktops too; see
-[Web apps](#web-apps-pwas) for the one X11 limitation.
+`~/.local/bin` must be on your `PATH`; most distributions add it
+automatically once the directory exists (log out and back in).
 
 ## Quick start
 
@@ -83,19 +167,37 @@ after it.
 | Option | Description |
 |---|---|
 | `-l`, `--label TEXT` | Menu name becomes `Chrome - TEXT` (default: NAME) |
-| `-i`, `--icon FILE` | Use your own image as the icon instead of the Chrome logo |
+| `-i`, `--icon FILE` | Use your own image as the icon instead of the Chrome logo (see [Icons](#icons)) |
 | `-r`, `--recolor` | Only redraw NAME's icon in the theme color picked in that Chrome (see [Icons](#icons)) |
 | `-f`, `--force` | Recreate an existing launcher and icon; the data directory is kept. Pass `-l`/`-i` again if you used them, or the label resets to NAME and the icon to the theme color (or stock logo). |
-| `-d`, `--delete` | Remove NAME's launcher, icon, data directory and cache, confirming each |
+| `-d`, `--delete` | Remove NAME's launcher, icon, data directory and cache, confirming each (see [Deleting](#deleting)) |
 | `-h`, `--help` | Show help |
+
+`-r` and `-d` can't be combined with other options.
 
 | Environment | Default |
 |---|---|
 | `CHROME_BIN` | `/usr/bin/google-chrome-stable` |
 | `CHROME_LOGO` | `/opt/google/chrome/product_logo_256.png` |
 
-All options are checked before anything is written, so a typo leaves nothing
-behind.
+For example, this makes a launcher for Chrome Beta, installed alongside the
+stable version by Google's `google-chrome-beta` package:
+
+```bash
+CHROME_BIN=/usr/bin/google-chrome-beta \
+CHROME_LOGO=/opt/google/chrome-beta/product_logo_256.png chrome-instance -l Beta beta
+```
+
+`CHROME_BIN` is written into the launcher, so set it again when recreating
+one with `-f`; `CHROME_LOGO` is only read when drawing the icon, so set it
+for `--recolor` too.
+
+Options are checked, and the icon is prepared, before anything is written, so
+a typo or unreadable image leaves nothing behind.
+
+Exit status: 0 on success, 1 on an error (such as a missing Chrome or an
+existing launcher without `-f`), 2 for invalid options, 130 if interrupted
+with Ctrl-C.
 
 ### Examples
 
@@ -142,7 +244,7 @@ Type=Application
 Name=Chrome - work
 GenericName=Web Browser
 Comment=Google Chrome (work profile)
-Exec=env CHROME_DESKTOP=chrome-work.desktop /usr/bin/google-chrome-stable --user-data-dir="/home/USER/.config/chrome-instances/work" --class="chrome-work" %U
+Exec=env CHROME_DESKTOP=chrome-work.desktop /usr/bin/google-chrome-stable --user-data-dir=/home/USER/.config/chrome-instances/work --class=chrome-work %U
 Icon=/home/USER/.local/share/icons/chrome-work.png
 Terminal=false
 Categories=Network;WebBrowser;
@@ -172,6 +274,10 @@ Key points:
 - No `--profile-directory` — Chrome opens the last-used profile in the data
   directory, so adding more profiles inside a launcher works naturally.
 - Right-click actions for a new window and a new incognito window.
+- Arguments are quoted and escaped as the
+  [Desktop Entry Specification](https://specifications.freedesktop.org/desktop-entry-spec/latest/)
+  requires, only when needed, so home directories containing spaces, `$`,
+  `%`, quotes or backslashes work.
 
 ## Web apps (PWAs)
 
@@ -227,6 +333,8 @@ again whenever you change the color.
 - The theme is read from the profile Chrome last used in that data directory.
 - Grayscale themes give a gray icon. Theme extensions and "Use GTK/Qt" have no
   single theme color, so `--recolor` reports that and leaves the icon alone.
+- Only Chrome's default color style is reproduced exactly; with another style
+  `--recolor` still draws the icon but prints a note.
 - Chrome saves a color change to disk within a few seconds; if `--recolor`
   still sees the old color, run it again.
 - The dock shows the new icon within a few seconds, or as soon as you open
@@ -235,12 +343,10 @@ again whenever you change the color.
 `--force` on an existing data directory also uses its theme color when it has
 one; otherwise it uses the stock logo.
 
-`--icon` images are converted to PNG when ImageMagick is available (the first
-frame for multi-image formats like `.ico`), otherwise copied as-is.
-
-The script prefers the system `convert` over `magick`, because a `magick`
-earlier in `PATH` may be a container wrapper (apx/distrobox) that can't see
-`/opt/google/chrome`.
+`--icon` accepts any image format Pillow reads — PNG, JPEG, GIF, WebP, BMP,
+ICO and more, but not SVG (convert an SVG to PNG first). The image is saved
+as PNG; for an `.ico` the largest size is used, for an animation the first
+frame.
 
 ## Deleting
 
@@ -258,28 +364,62 @@ from inside that Chrome first, or remove those files afterwards.
 ## Menu refresh
 
 GNOME Shell watches `~/.local/share/applications` and picks up new or removed
-launchers automatically. After creating or deleting, the script also runs
-`update-desktop-database` to refresh the MIME cache so each launcher appears
-correctly under "Open With" and in default-browser settings.
+launchers automatically. After creating or deleting, `chrome-instance` also
+runs `update-desktop-database` (when installed) to refresh the MIME cache so
+each launcher appears correctly under "Open With" and in default-browser
+settings.
 
 Icons are harder: GNOME Shell caches them by path and doesn't watch the icon
 files, so an icon rewritten in place (`--recolor`, `-f`) would stay stale until
 you log out. It does notice when an icon directory's modification time changes,
-and then reloads its icons, so after writing an icon the script touches
+and then reloads its icons, so after writing an icon `chrome-instance` touches
 `~/.local/share/icons`. The dock (including Dash to Panel) updates within a
 few seconds, or as soon as the overview is opened.
 
-## Uninstall
+## Upgrade and uninstall
 
-Delete each instance you no longer want with `chrome-instance -d NAME`, then:
+Upgrade to the latest version:
+
+- With pipx: `pipx reinstall chrome-instance`. It reinstalls from wherever
+  you installed from: GitHub fetches the latest version; for a clone, run
+  `git pull` in it first.
+- Without pipx: in the clone, run
+  `git pull && ~/.local/share/chrome-instance/venv/bin/pip install --upgrade .`
+
+Existing launchers keep working across upgrades; recreate one with `-f` to
+pick up changes to the generated launcher.
+
+To uninstall, first delete each instance you no longer want with
+`chrome-instance -d NAME`, then remove the tool the way you installed it:
 
 ```bash
-rm ~/.local/bin/chrome-instance
+pipx uninstall chrome-instance                                       # with pipx
+rm -r ~/.local/share/chrome-instance ~/.local/bin/chrome-instance    # without pipx
 ```
 
-Removing the script leaves existing instances working; they're ordinary
+Removing the tool leaves existing instances working; they're ordinary
 launchers and Chrome data directories.
 
+## Development
+
+The whole tool is one module, `chrome_instance.py`; `pyproject.toml` declares
+its dependencies and the `chrome-instance` command. To work on it, install it
+in editable mode in a virtual environment inside the clone, so changes take
+effect without reinstalling:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e .
+.venv/bin/chrome-instance --help
+```
+
+To try changes without touching your real launchers and Chrome data, point
+the XDG directories somewhere temporary:
+
+```bash
+export XDG_CONFIG_HOME=/tmp/ci-test/config XDG_DATA_HOME=/tmp/ci-test/data XDG_CACHE_HOME=/tmp/ci-test/cache
+.venv/bin/chrome-instance -l Test test
+```
 
 ## TODO
 
