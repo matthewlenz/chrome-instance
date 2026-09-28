@@ -25,6 +25,7 @@ Not affiliated with or endorsed by Google.
 - [What it creates](#what-it-creates)
 - [Web apps (PWAs)](#web-apps-pwas)
 - [Icons](#icons)
+- [Listing](#listing)
 - [Deleting](#deleting)
 - [Menu refresh](#menu-refresh)
 - [Upgrade and uninstall](#upgrade-and-uninstall)
@@ -142,7 +143,7 @@ automatically once the directory exists (log out and back in).
 ## Quick start
 
 ```bash
-chrome-instance -l "Work" work       # 1. create the launcher "Chrome - Work"
+chrome-instance -m "Work" work       # 1. create the launcher "Chrome - Work"
 ```
 
 2. Open **Chrome - Work** from the app menu and sign in. It's a brand-new
@@ -167,26 +168,27 @@ after it.
 
 | Option | Description |
 |---|---|
-| `-l`, `--label TEXT` | Menu name becomes `Chrome - TEXT` (default: NAME) |
-| `-i`, `--icon FILE` | Use your own image as the icon instead of the Chrome logo (see [Icons](#icons)) |
+| `-m`, `--menu TEXT` | Menu name becomes `Chrome - TEXT` (default: NAME) |
+| `-i`, `--icon FILE` | Use your own image as the icon. Default: the Chrome logo, or with `-f`, the logo in the instance's theme color if it has one (see [Icons](#icons)) |
 | `-r`, `--recolor` | Only redraw NAME's icon in the theme color picked in that Chrome (see [Icons](#icons)) |
-| `-f`, `--force` | Recreate an existing launcher and icon; the data directory is kept. Pass `-l`/`-i` again if you used them, or the label resets to NAME and the icon to the theme color (or stock logo). |
+| `-f`, `--force` | Recreate an existing launcher and icon; the data directory is kept. Pass `-m`/`-i` again if you used them, or the menu name resets to NAME and the icon to the theme color (or stock logo). |
 | `-d`, `--delete` | Remove NAME's launcher, icon, data directory and cache, confirming each (see [Deleting](#deleting)) |
+| `-l`, `--list` | List the standard Chrome and all instances, with their profiles and web apps, and show which is the default browser (see [Listing](#listing)); takes no NAME |
 | `-h`, `--help` | Show help |
 
-`-r` and `-d` can't be combined with other options.
+`-r`, `-d` and `-l` can't be combined with other options.
 
-| Environment | Default |
-|---|---|
-| `CHROME_BIN` | `/usr/bin/google-chrome-stable` |
-| `CHROME_LOGO` | `/opt/google/chrome/product_logo_256.png` |
+| Environment | Purpose | Default |
+|---|---|---|
+| `CHROME_BIN` | Chrome program the launcher runs | `/usr/bin/google-chrome-stable` |
+| `CHROME_LOGO` | Chrome logo, used as the default icon and for `--recolor` | `/opt/google/chrome/product_logo_256.png` |
 
 For example, this makes a launcher for Chrome Beta, installed alongside the
 stable version by Google's `google-chrome-beta` package:
 
 ```bash
 CHROME_BIN=/usr/bin/google-chrome-beta \
-CHROME_LOGO=/opt/google/chrome-beta/product_logo_256.png chrome-instance -l Beta beta
+CHROME_LOGO=/opt/google/chrome-beta/product_logo_256.png chrome-instance -m Beta beta
 ```
 
 `CHROME_BIN` is written into the launcher, so set it again when recreating
@@ -204,10 +206,11 @@ with Ctrl-C.
 
 ```bash
 chrome-instance work                              # "Chrome - work", stock Chrome icon
-chrome-instance -l "acme.com" acme                # "Chrome - acme.com"
+chrome-instance -m "acme.com" acme                # "Chrome - acme.com"
 chrome-instance --recolor acme                    # icon in acme's Chrome theme color
 chrome-instance acme -f -i ~/Pictures/acme.png    # custom icon
 chrome-instance -d acme                           # remove it (asks for each item)
+chrome-instance -l                                # show all Chromes and the default browser
 ```
 
 After creating one, open it from the app menu and sign in to Chrome.
@@ -328,7 +331,7 @@ The logo's red, green and yellow segments are redrawn in three tones of the
 theme — the same Material palette Chrome derives from that color for its own
 window frame (dark on top, light bottom-left, muted right). The blue center and
 white ring stay as they are, so it still reads as Chrome. `--recolor` only
-replaces the icon file; the launcher, label and data are untouched. Run it
+replaces the icon file; the launcher, menu name and data are untouched. Run it
 again whenever you change the color.
 
 - The theme is read from the profile Chrome last used in that data directory.
@@ -348,6 +351,54 @@ one; otherwise it uses the stock logo.
 ICO and more, but not SVG (convert an SVG to PNG first). The image is saved
 as PNG; for an `.ico` the largest size is used, for an animation the first
 frame.
+
+## Listing
+
+`chrome-instance --list` (or `-l`) shows every Chrome on the system: the
+standard Google Chrome (and its beta, dev and canary channels, if installed or
+used), then each instance. For example:
+
+```
+Default browser: Chrome - Work (chrome-work.desktop)
+
+google-chrome: Google Chrome  [standard]  [running]
+  Launcher:  /usr/share/applications/google-chrome.desktop
+  Chrome:    /usr/bin/google-chrome-stable
+  Data dir:  ~/.config/google-chrome (1.4G)
+  Cache:     ~/.cache/google-chrome (1.4G)
+  Profiles:  Default: Personal <me@gmail.com>, default theme
+  Web apps:  Gmail
+
+work: Chrome - Work  [default browser]
+  Launcher:  ~/.local/share/applications/chrome-work.desktop
+  Chrome:    /usr/bin/google-chrome-stable
+  Data dir:  ~/.config/chrome-instances/work (1.2G)
+  Cache:     ~/.cache/chrome-instances/work (73M)
+  Profiles:  work: Work <me@work.example>, theme #4CAF50
+             Profile 1: Side project, grayscale theme, last used
+  Web apps:  Microsoft Teams, Outlook
+```
+
+For each one it shows:
+
+- **Tags:** `[standard]` for Google's own Chrome, `[default browser]`, and
+  `[running]` if a Chrome is using its data directory right now.
+- **Launcher** and the **Chrome** program it starts. An instance whose
+  launcher was deleted but whose data remains says how to recreate it.
+- **Data dir** and **Cache**, with their size on disk.
+- **Profiles** inside the data directory, from Chrome's `Local State`: the
+  name, the signed-in Google account, and the theme (with a color swatch
+  when printing to a terminal; set `NO_COLOR` to turn it off). "last used"
+  marks the profile Chrome opens, which `--recolor` reads, when there are
+  several. A new instance shows "none yet" until it's first launched.
+- **Web apps** installed from it (see [Web apps](#web-apps-pwas)).
+
+The default browser comes from `xdg-settings get default-web-browser`, which
+asks the desktop the same way apps do, falling back to
+`xdg-mime query default x-scheme-handler/https`. If it's not one of the
+listed Chromes, the top line still names it (e.g. Firefox).
+
+`--list` only reads files; it changes nothing.
 
 ## Deleting
 
@@ -419,7 +470,7 @@ the XDG directories somewhere temporary:
 
 ```bash
 export XDG_CONFIG_HOME=/tmp/ci-test/config XDG_DATA_HOME=/tmp/ci-test/data XDG_CACHE_HOME=/tmp/ci-test/cache
-.venv/bin/chrome-instance -l Test test
+.venv/bin/chrome-instance -m Test test
 ```
 
 ## TODO
@@ -447,7 +498,8 @@ inconclusive either way.
    restore afterwards.
 2. Create a test instance, open it, go to `chrome://settings/defaultBrowser`,
    and click "Make default".
-3. Check `xdg-settings get default-web-browser`: `chrome-NAME.desktop` means
+3. Check `chrome-instance --list` (or `xdg-settings get default-web-browser`):
+   `chrome-NAME.desktop` as the default browser means
    `CHROME_DESKTOP` works; `google-chrome.desktop` means it's ignored.
 4. Restore the original default and delete the test instance.
 

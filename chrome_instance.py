@@ -25,6 +25,8 @@ Commands, chosen by options (see parse_args):
     --recolor            rewrite only the icon, from the instance's theme color
     --delete             remove the launcher, icon, data dir and cache, asking
                          before each
+    -l, --list           show the standard Chrome and every instance, and
+                         which one is the default browser (reads only)
 
 See README.md for usage and background.
 """
@@ -35,10 +37,12 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple, Optional
 
 # Third-party dependencies, installed alongside the package by pip/pipx. When
 # the file is run directly without them, say how to install instead of
@@ -58,6 +62,16 @@ PROG = os.path.basename(sys.argv[0])
 # Overridable with the CHROME_BIN and CHROME_LOGO environment variables.
 DEFAULT_CHROME_BIN = "/usr/bin/google-chrome-stable"
 DEFAULT_CHROME_LOGO = "/opt/google/chrome/product_logo_256.png"
+
+# The Chrome channels Google packages for Linux, which --list shows alongside
+# the instances. Each channel's launcher is <name>.desktop, and it keeps its
+# data in ~/.config/<name> and its cache in ~/.cache/<name>.
+STANDARD_CHANNELS = ["google-chrome", "google-chrome-beta", "google-chrome-unstable",
+                     "google-chrome-canary"]
+
+# Allowed instance NAMEs. NAME ends up in file names, the window class and the
+# profile folder name, so keep it to characters that are safe in all of them.
+NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 
 # The logo segments to recolor, counterclockwise from the top, as (chroma,
 # tone) in the theme color's hue. These are Chrome's own default ("tonal
@@ -86,6 +100,36 @@ def xdg_dir(var, default):
     return Path(os.environ.get(var) or Path.home() / default)
 
 
+def instances_root():
+    """The directory holding every instance's data dir.
+
+    It lives under ~/.config like Chrome's own data dir: only then does Chrome
+    put its disk cache under ~/.cache (same relative path) instead of inside
+    the data dir, where backups would include it.
+    """
+    return xdg_dir("XDG_CONFIG_HOME", ".config") / "chrome-instances"
+
+
+def chrome_running(data_dir):
+    """True if a Chrome process is currently using data_dir.
+
+    Chrome keeps a SingletonLock symlink in its data dir pointing at
+    "<hostname>-<pid>". Checking that the pid is alive (signal 0 only tests,
+    it sends nothing) skips a stale lock left behind by a crash. This works
+    however that Chrome was started.
+    """
+    try:
+        pid = int(os.readlink(data_dir / "SingletonLock").rsplit("-", 1)[1])
+        if pid <= 0:  # os.kill would address a process group instead
+            return False
+        os.kill(pid, 0)
+    except PermissionError:
+        return True  # the process exists but belongs to someone else
+    except (OSError, ValueError, IndexError):
+        return False  # no lock, a malformed one, or a dead process
+    return True
+
+
 class Instance:
     """The files and names belonging to one Chrome instance, NAME.
 
@@ -95,10 +139,7 @@ class Instance:
     def __init__(self, name):
         self.name = name
         data_home = xdg_dir("XDG_DATA_HOME", ".local/share")
-        # The data dir lives under ~/.config like Chrome's own: only then does
-        # Chrome put its disk cache under ~/.cache (same relative path) instead
-        # of inside it, where backups would include it.
-        self.profile_dir = xdg_dir("XDG_CONFIG_HOME", ".config") / "chrome-instances" / name
+        self.profile_dir = instances_root() / name
         self.cache_dir = xdg_dir("XDG_CACHE_HOME", ".cache") / "chrome-instances" / name
         self.desktop_file = data_home / "applications" / f"chrome-{name}.desktop"
         self.icon_file = data_home / "icons" / f"chrome-{name}.png"
@@ -113,23 +154,8 @@ class Instance:
         return not self.profile_dir.is_dir() or not any(self.profile_dir.iterdir())
 
     def chrome_running(self):
-        """True if a Chrome process is currently using the data dir.
-
-        Chrome keeps a SingletonLock symlink in its data dir pointing at
-        "<hostname>-<pid>". Checking that the pid is alive (signal 0 only
-        tests, it sends nothing) skips a stale lock left behind by a crash.
-        This works however that Chrome was started.
-        """
-        try:
-            pid = int(os.readlink(self.profile_dir / "SingletonLock").rsplit("-", 1)[1])
-            if pid <= 0:  # os.kill would address a process group instead
-                return False
-            os.kill(pid, 0)
-        except PermissionError:
-            return True  # the process exists but belongs to someone else
-        except (OSError, ValueError, IndexError):
-            return False  # no lock, a malformed one, or a dead process
-        return True
+        """True if a Chrome process is currently using the data dir."""
+        return chrome_running(self.profile_dir)
 
 
 def write_file(path, data):
@@ -182,15 +208,21 @@ def load_json(path):
         return None
 
 
-def read_theme(data_dir):
-    """Find the theme color of the profile Chrome last used in data_dir.
+class Theme(NamedTuple):
+    """A Chrome profile's theme, as read by profile_theme."""
 
-    Returns (seed, profile): seed is the theme color as a 0xRRGGBB int, or
-    None for a grayscale theme; profile is the profile folder's name. Raises
-    NoThemeColor when the profile has no usable color.
+    # "color" (a color picked in Customize Chrome), "grayscale", "default"
+    # (nothing picked), "system" (Use GTK/Qt), "extension" (a theme
+    # extension), or "missing" (no Preferences file: never launched)
+    kind: str
+    seed: Optional[int] = None  # the picked color as 0xRRGGBB, for "color"
+    default_style: bool = True  # False if a non-default color style is set
 
-    Chrome records the last used profile in "Local State" and each profile's
-    theme in its "Preferences" file (both JSON):
+
+def profile_theme(data_dir, profile):
+    """Read the theme of one profile folder in a Chrome data dir.
+
+    Chrome keeps each profile's theme in its "Preferences" file (JSON):
 
         extensions.theme.id             which kind of theme is active: "" or
                                         "user_color_theme_id" for a color
@@ -204,31 +236,53 @@ def read_theme(data_dir):
         autogenerated.theme.color       the color, for older Chrome versions
                                         that generated a theme from it
     """
-    state = load_json(data_dir / "Local State") or {}
-    profile = state.get("profile", {}).get("last_used") or "Default"
     prefs = load_json(data_dir / profile / "Preferences")
     if prefs is None:
-        raise NoThemeColor(f"no Chrome profile in {data_dir} yet; launch it and pick a color first")
+        return Theme("missing")
     theme = prefs.get("browser", {}).get("theme", {})
     ext_theme = prefs.get("extensions", {}).get("theme", {})
     if ext_theme.get("system_theme", 0):
-        raise NoThemeColor(f'profile "{profile}" uses the GTK/Qt system theme, which has no theme color')
+        return Theme("system")
     theme_id = ext_theme.get("id", "")
     if theme_id == "autogenerated_theme_id":
         seed = prefs.get("autogenerated", {}).get("theme", {}).get("color")
     elif theme_id in ("", "user_color_theme_id"):
         seed = theme.get("user_color")
     else:
-        raise NoThemeColor(f'profile "{profile}" uses a theme extension, which has no theme color')
+        return Theme("extension")
     if theme.get("is_grayscale", False):
-        return None, profile
+        return Theme("grayscale")
     if seed is None:
+        return Theme("default")
+    return Theme("color", seed & 0xFFFFFF,  # drop the alpha byte (and the sign)
+                 theme.get("color_variant", 1) in (0, 1))
+
+
+def read_theme(data_dir):
+    """Find the theme color of the profile Chrome last used in data_dir, the
+    one an instance's icon is drawn from.
+
+    Returns (seed, profile): seed is the theme color as a 0xRRGGBB int, or
+    None for a grayscale theme; profile is the profile folder's name. Raises
+    NoThemeColor when the profile has no usable color.
+    """
+    # Chrome records the last used profile folder in "Local State" (JSON).
+    state = load_json(data_dir / "Local State") or {}
+    profile = state.get("profile", {}).get("last_used") or "Default"
+    theme = profile_theme(data_dir, profile)
+    if theme.kind == "missing":
+        raise NoThemeColor(f"no Chrome profile in {data_dir} yet; launch it and pick a color first")
+    if theme.kind == "system":
+        raise NoThemeColor(f'profile "{profile}" uses the GTK/Qt system theme, which has no theme color')
+    if theme.kind == "extension":
+        raise NoThemeColor(f'profile "{profile}" uses a theme extension, which has no theme color')
+    if theme.kind == "default":
         raise NoThemeColor(f'profile "{profile}" has no theme color; pick one in Customize Chrome > Color')
-    if theme.get("color_variant", 1) not in (0, 1):
+    if not theme.default_style:
         # Other styles derive their palettes differently; SEGMENT_TONES
         # follows the default one.
         print("note: only Chrome's default color style is reproduced exactly", file=sys.stderr)
-    return seed & 0xFFFFFF, profile  # drop the alpha byte (and the sign)
+    return theme.seed, profile
 
 
 def segment_colors(seed):
@@ -405,7 +459,292 @@ Exec={cmd} --incognito
 """
 
 
+# --- Reading launchers ------------------------------------------------------------
+
+def applications_dirs():
+    """The directories launchers are installed in, highest priority first:
+    ~/.local/share/applications, then those of $XDG_DATA_DIRS (by default
+    /usr/local/share and /usr/share), per the XDG Base Directory spec."""
+    data_dirs = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    return [xdg_dir("XDG_DATA_HOME", ".local/share") / "applications",
+            *(Path(d) / "applications" for d in data_dirs.split(":") if d)]
+
+
+def find_launcher(desktop_id):
+    """The launcher file for a desktop file id such as "google-chrome.desktop",
+    as the desktop would pick it (a user's copy overrides the system's), or
+    None if it isn't installed."""
+    for folder in applications_dirs():
+        if (folder / desktop_id).is_file():
+            return folder / desktop_id
+    return None
+
+
+def read_desktop_entry(path):
+    """The keys of a launcher's [Desktop Entry] group, with the spec's string
+    escapes (\\s, \\n, \\t, \\r, \\\\) undone. Empty if unreadable."""
+    escapes = {"s": " ", "n": "\n", "t": "\t", "r": "\r"}
+    entry, in_group = {}, False
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return entry
+    for line in lines:
+        line = line.strip()
+        if line.startswith("["):
+            in_group = line == "[Desktop Entry]"
+        elif in_group and "=" in line and not line.startswith("#"):
+            key, _, value = line.partition("=")
+            value = re.sub(r"\\(.)", lambda m: escapes.get(m.group(1), m.group(1)), value.strip())
+            entry.setdefault(key.strip(), value)
+    return entry
+
+
+def exec_argv(entry):
+    """A launcher's Exec= command as a list of arguments, without field codes
+    like %U. The spec's quoting rules are a subset of the shell's, so shlex
+    parses them. Empty if the line is missing or malformed."""
+    try:
+        args = shlex.split(entry.get("Exec", ""))
+    except ValueError:
+        return []
+    return [a.replace("%%", "%") for a in args if not re.fullmatch(r"%[A-Za-z]", a)]
+
+
+def arg_value(argv, option):
+    """The value of an "--option=value" argument in argv, or None."""
+    prefix = f"{option}="
+    return next((a[len(prefix):] for a in argv if a.startswith(prefix)), None)
+
+
+def chrome_command(argv):
+    """The program an Exec= command runs, skipping a leading
+    `env VAR=value ...` like the one in this tool's launchers."""
+    for arg in argv:
+        if arg != "env" and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", arg):
+            return arg
+    return None
+
+
+# --- Listing ----------------------------------------------------------------------
+
+class Browser(NamedTuple):
+    """One Chrome shown by --list: a standard channel or an instance."""
+
+    id: str                  # the instance's NAME, or the channel's name
+    label: str               # the launcher's menu name
+    launcher: Optional[Path]  # None if the launcher is missing
+    data_dir: Path
+    cache_dir: Path
+    standard: bool           # a standard Chrome channel rather than an instance
+
+
+def instance_names():
+    """The NAMEs of all instances: every data dir under instances_root(), plus
+    any launcher this tool wrote whose data dir has since been deleted."""
+    names = set()
+    if instances_root().is_dir():
+        names.update(p.name for p in instances_root().iterdir()
+                     if p.is_dir() and NAME_PATTERN.fullmatch(p.name))
+    # Chrome's web app launchers also start with "chrome-" (chrome-<app
+    # id>-<profile>.desktop), so only count launchers whose command uses the
+    # data dir this tool gives that NAME.
+    folder = xdg_dir("XDG_DATA_HOME", ".local/share") / "applications"
+    for path in folder.glob("chrome-*.desktop"):
+        name = path.name[len("chrome-"):-len(".desktop")]
+        if NAME_PATTERN.fullmatch(name):
+            data_dir = arg_value(exec_argv(read_desktop_entry(path)), "--user-data-dir")
+            if data_dir == str(Instance(name).profile_dir):
+                names.add(name)
+    return names
+
+
+def find_browsers():
+    """Every Chrome to list: the standard channels that are installed or have
+    data, then the instances by NAME."""
+    config = xdg_dir("XDG_CONFIG_HOME", ".config")
+    cache = xdg_dir("XDG_CACHE_HOME", ".cache")
+    browsers = []
+    for channel in STANDARD_CHANNELS:
+        launcher = find_launcher(f"{channel}.desktop")
+        if launcher or (config / channel).is_dir():
+            label = read_desktop_entry(launcher).get("Name", channel) if launcher else channel
+            browsers.append(Browser(channel, label, launcher, config / channel, cache / channel, True))
+    for name in sorted(instance_names()):
+        inst = Instance(name)
+        launcher = inst.desktop_file if inst.desktop_file.is_file() else None
+        label = read_desktop_entry(launcher).get("Name", name) if launcher else name
+        browsers.append(Browser(name, label, launcher, inst.profile_dir, inst.cache_dir, False))
+    return browsers
+
+
+def find_web_apps():
+    """Web app launchers Chrome created, as {data dir: [app names]}.
+
+    Chrome writes them to ~/.local/share/applications with --app-id in their
+    command. An instance's apps name its --user-data-dir. A standard
+    Chrome's apps don't, so they're matched by the Chrome command they run,
+    whose name is also its data dir's (/opt/google/chrome-beta/
+    google-chrome-beta uses ~/.config/google-chrome-beta).
+    """
+    config = xdg_dir("XDG_CONFIG_HOME", ".config")
+    apps = {}
+    folder = xdg_dir("XDG_DATA_HOME", ".local/share") / "applications"
+    for path in sorted(folder.glob("*.desktop")):
+        entry = read_desktop_entry(path)
+        argv = exec_argv(entry)
+        if not arg_value(argv, "--app-id"):
+            continue
+        data_dir = arg_value(argv, "--user-data-dir")
+        if data_dir is None:
+            command = chrome_command(argv)
+            if not command:
+                continue
+            data_dir = config / Path(command).name.removesuffix("-stable")
+        apps.setdefault(Path(data_dir), []).append(entry.get("Name", path.stem))
+    return apps
+
+
+class Profile(NamedTuple):
+    """A Chrome profile inside a data dir, from its Local State."""
+
+    folder: str      # e.g. "Default" or "Profile 1"
+    name: str        # the name shown in Chrome's profile menu
+    account: str     # the signed-in Google account's email, or ""
+    last_used: bool  # the profile Chrome opens (and --recolor reads)
+
+
+def chrome_profiles(data_dir):
+    """The profiles in a data dir, in Chrome's menu order. Empty until
+    Chrome has been launched with it.
+
+    Chrome lists them in "Local State" (JSON): profile.info_cache maps each
+    profile folder to its details, profile.profiles_order gives the menu
+    order and profile.last_used the profile it opens.
+    """
+    info = (load_json(data_dir / "Local State") or {}).get("profile", {})
+    cache = info.get("info_cache", {})
+    order = [p for p in info.get("profiles_order", []) if p in cache]
+    order += [p for p in cache if p not in order]
+    return [Profile(p, cache[p].get("name", p), cache[p].get("user_name", ""),
+                    p == info.get("last_used")) for p in order]
+
+
+def default_browser():
+    """The desktop file id of the default web browser (for example
+    "google-chrome.desktop"), or None if it can't be determined.
+
+    xdg-settings asks the desktop environment the way desktop apps do;
+    xdg-mime, which reads the mimeapps.list files, is the fallback.
+    """
+    for cmd in (["xdg-settings", "get", "default-web-browser"],
+                ["xdg-mime", "query", "default", "x-scheme-handler/https"]):
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if out.endswith(".desktop"):
+            return out
+    return None
+
+
+def home_relative(path):
+    """path as a string, with the home directory shortened to ~."""
+    home = str(Path.home())
+    text = str(path)
+    return "~" + text[len(home):] if text == home or text.startswith(home + "/") else text
+
+
+def color_swatch(seed):
+    """A colored square showing the theme color, when printing to a terminal
+    that allows color (see https://no-color.org); otherwise nothing."""
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        return ""
+    r, g, b = (seed >> 16) & 255, (seed >> 8) & 255, seed & 255
+    return f" \x1b[38;2;{r};{g};{b}m■\x1b[0m"
+
+
+def describe_theme(theme):
+    """A short description of a profile's theme for --list, or None."""
+    if theme.kind == "color":
+        return f"theme #{theme.seed:06X}{color_swatch(theme.seed)}"
+    return {"grayscale": "grayscale theme", "default": "default theme",
+            "system": "GTK/Qt theme", "extension": "theme extension"}.get(theme.kind)
+
+
+def print_browser(browser, default_id, web_apps):
+    """Print one --list entry: a heading line, then indented details."""
+    def row(key, value):
+        """An aligned "Key: value" line; an empty key continues the previous row."""
+        print(f"  {key + ':' if key else '':<11}{value}")
+
+    tags = ["standard"] if browser.standard else []
+    if browser.launcher and browser.launcher.name == default_id:
+        tags.append("default browser")
+    if chrome_running(browser.data_dir):
+        tags.append("running")
+    print(f"{browser.id}: {browser.label}" + "".join(f"  [{t}]" for t in tags))
+
+    if browser.launcher:
+        row("Launcher", home_relative(browser.launcher))
+        command = chrome_command(exec_argv(read_desktop_entry(browser.launcher)))
+        if command:
+            row("Chrome", command)
+    elif browser.standard:
+        row("Launcher", "not installed")
+    else:
+        row("Launcher", f"missing; recreate it with: {PROG} {browser.id}")
+
+    if not browser.data_dir.is_dir():
+        row("Data dir", f"{home_relative(browser.data_dir)} (not created yet)")
+        return
+    row("Data dir", f"{home_relative(browser.data_dir)} ({disk_usage(browser.data_dir)})")
+    if browser.cache_dir.is_dir():
+        row("Cache", f"{home_relative(browser.cache_dir)} ({disk_usage(browser.cache_dir)})")
+
+    profiles = chrome_profiles(browser.data_dir)
+    if not profiles:
+        row("Profiles", "none yet (launch it and sign in)")
+    for i, profile in enumerate(profiles):
+        details = [f"{profile.folder}: {profile.name}"
+                   + (f" <{profile.account}>" if profile.account else "")]
+        theme = describe_theme(profile_theme(browser.data_dir, profile.folder))
+        if theme:
+            details.append(theme)
+        if profile.last_used and len(profiles) > 1:
+            details.append("last used")
+        row("Profiles" if i == 0 else "", ", ".join(details))
+
+    apps = sorted(web_apps.get(browser.data_dir, []), key=str.lower)
+    if apps:
+        row("Web apps", ", ".join(apps))
+
+
 # --- Commands ---------------------------------------------------------------------
+
+def list_browsers():
+    """--list: show the standard Chrome channels and every instance, with
+    their launchers, data, profiles, web apps and which is the default
+    browser. Only reads; changes nothing."""
+    default_id = default_browser()
+    if default_id:
+        launcher = find_launcher(default_id)
+        name = read_desktop_entry(launcher).get("Name") if launcher else None
+        print(f"Default browser: {name} ({default_id})" if name else f"Default browser: {default_id}")
+    else:
+        print("Default browser: unknown (neither xdg-settings nor xdg-mime reported one)")
+
+    browsers = find_browsers()
+    web_apps = find_web_apps()
+    for browser in browsers:
+        print()
+        print_browser(browser, default_id, web_apps)
+    if not any(not b.standard for b in browsers):
+        print()
+        print(f"No instances yet; create one with: {PROG} NAME")
+
 
 def confirm(prompt):
     """Ask a yes/no question on the terminal. Only "y" or "yes" (any case)
@@ -478,7 +817,7 @@ def delete(inst):
 
 def recolor(inst, logo):
     """--recolor: redraw only the instance's icon in its current theme
-    color. The launcher, label and data dir are left alone."""
+    color. The launcher, menu name and data dir are left alone."""
     if not os.path.lexists(inst.desktop_file):
         die(f"no launcher for '{inst.name}' (create it first)")
     if not os.path.isfile(logo):
@@ -564,20 +903,22 @@ def parse_args():
     """Parse and validate the command line. Invalid usage exits with status 2
     and a message, before anything is read or written."""
     parser = argparse.ArgumentParser(
-        prog=PROG, usage="%(prog)s [options] NAME",
+        prog=PROG, usage="%(prog)s [options] NAME\n       %(prog)s --list",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Create a Chrome launcher with its own data directory, so it runs as a\n"
                     "separate Chrome with its own dock icon.",
         epilog="environment:\n"
                f"  CHROME_BIN        Chrome executable (default: {DEFAULT_CHROME_BIN})\n"
-               f"  CHROME_LOGO       logo to recolor (default: {DEFAULT_CHROME_LOGO})")
-    parser.add_argument("name", metavar="NAME",
+               "  CHROME_LOGO       Chrome logo, used as the default icon and for --recolor\n"
+               f"                    (default: {DEFAULT_CHROME_LOGO})")
+    parser.add_argument("name", metavar="NAME", nargs="?",
                         help='short id, e.g. "work" -> chrome-work.desktop; '
                              "data dir: ~/.config/chrome-instances/NAME")
-    parser.add_argument("-l", "--label", metavar="TEXT",
-                        help='menu label suffix (default: NAME) -> "Chrome - TEXT"')
+    parser.add_argument("-m", "--menu", metavar="TEXT",
+                        help='menu name suffix (default: NAME) -> "Chrome - TEXT"')
     parser.add_argument("-i", "--icon", metavar="FILE",
-                        help="use this image as the icon instead of the Chrome logo")
+                        help="use this image as the icon (default: the Chrome logo, or "
+                             "with -f, the logo in the instance's theme color if it has one)")
     parser.add_argument("-r", "--recolor", action="store_true",
                         help="only redraw NAME's icon in the theme color picked in that "
                              "Chrome (Customize Chrome > Color)")
@@ -585,25 +926,35 @@ def parse_args():
                         help="overwrite an existing launcher/icon (data dir is kept)")
     parser.add_argument("-d", "--delete", action="store_true",
                         help="remove NAME's launcher, icon and data dir, confirming each")
+    parser.add_argument("-l", "--list", action="store_true",
+                        help="list the standard Chrome and all instances, with their "
+                             "profiles, web apps, and which is the default browser")
     args = parser.parse_args()
 
-    # NAME ends up in file names, the window class and the profile folder
-    # name, so keep it to characters that are safe in all of them.
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.name):
+    if args.list:
+        if args.name or args.menu or args.icon or args.recolor or args.force or args.delete:
+            parser.error("--list takes no NAME or other options")
+        return args
+    if args.name is None:
+        parser.error("the following arguments are required: NAME")
+    if not NAME_PATTERN.fullmatch(args.name):
         parser.error("NAME may only contain letters, digits, - and _")
-    if args.delete and (args.label or args.icon or args.recolor or args.force):
+    if args.delete and (args.menu or args.icon or args.recolor or args.force):
         parser.error("--delete can't be combined with other options")
-    if args.recolor and (args.label or args.icon or args.force):
-        parser.error("--recolor only changes the icon; use --force to change the label or icon file")
-    # A newline in the label would start a new line (key) in the launcher.
-    if args.label is not None and (not args.label or any(ord(c) < 32 or ord(c) == 127 for c in args.label)):
-        parser.error("--label must be non-empty and can't contain control characters")
+    if args.recolor and (args.menu or args.icon or args.force):
+        parser.error("--recolor only changes the icon; use --force to change the menu name or icon file")
+    # A newline in the menu name would start a new line (key) in the launcher.
+    if args.menu is not None and (not args.menu or any(ord(c) < 32 or ord(c) == 127 for c in args.menu)):
+        parser.error("--menu must be non-empty and can't contain control characters")
     return args
 
 
 def run():
     """Parse the command line and run the chosen command."""
     args = parse_args()
+    if args.list:
+        list_browsers()
+        return
     inst = Instance(args.name)
     chrome_bin = os.environ.get("CHROME_BIN") or DEFAULT_CHROME_BIN
     logo = os.environ.get("CHROME_LOGO") or DEFAULT_CHROME_LOGO
@@ -613,7 +964,7 @@ def run():
     elif args.recolor:
         recolor(inst, logo)
     else:
-        create(inst, args.label or args.name, args.icon, args.force, chrome_bin, logo)
+        create(inst, args.menu or args.name, args.icon, args.force, chrome_bin, logo)
 
 
 def main():
