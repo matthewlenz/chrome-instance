@@ -11,7 +11,7 @@ For an instance NAME it manages:
     ~/.config/chrome-instances/NAME/                  Chrome's --user-data-dir
     ~/.cache/chrome-instances/NAME/                   its disk cache (made by Chrome)
     ~/.local/share/applications/chrome-NAME.desktop   the launcher
-    ~/.local/share/icons/chrome-NAME.png              the launcher's icon
+    ~/.local/share/icons/chrome-NAME.<hash>.png       the launcher's icon
 
 (following $XDG_CONFIG_HOME, $XDG_CACHE_HOME and $XDG_DATA_HOME when set).
 
@@ -32,6 +32,7 @@ See README.md for usage and background.
 """
 
 import argparse
+import hashlib
 import io
 import json
 import math
@@ -142,7 +143,7 @@ class Instance:
         self.profile_dir = instances_root() / name
         self.cache_dir = xdg_dir("XDG_CACHE_HOME", ".cache") / "chrome-instances" / name
         self.desktop_file = data_home / "applications" / f"chrome-{name}.desktop"
-        self.icon_file = data_home / "icons" / f"chrome-{name}.png"
+        self.icons_dir = data_home / "icons"
         # Chrome's --class sets its windows' WM class (and Wayland app_id).
         # The launcher's StartupWMClass must match it for the dock to show
         # this launcher's icon on those windows.
@@ -156,6 +157,28 @@ class Instance:
     def chrome_running(self):
         """True if a Chrome process is currently using the data dir."""
         return chrome_running(self.profile_dir)
+
+    def icon_path(self, icon):
+        """Where to store icon (PNG bytes): chrome-NAME.<hash>.png, named
+        after a hash of the image itself.
+
+        GNOME Shell caches icon images by file name and doesn't redraw icons
+        already on screen when their file changes, so an icon rewritten in
+        place can stay stale for minutes. A changed image therefore gets a new
+        file name, and the launcher's Icon= is pointed at it: GNOME watches
+        the launchers and reloads an app when its launcher changes, so the
+        dash shows the new icon at once (the overview's app grid may still
+        lag). NAME can't contain ".", so the names never overlap between
+        instances.
+        """
+        return self.icons_dir / f"chrome-{self.name}.{hashlib.sha256(icon).hexdigest()[:8]}.png"
+
+    def icon_files(self):
+        """All of this instance's icon files that exist: chrome-NAME.<hash>.png,
+        and chrome-NAME.png from versions before icons were named by hash."""
+        pattern = re.compile(rf"chrome-{re.escape(self.name)}(\.[0-9a-f]{{8}})?\.png")
+        return sorted(p for p in self.icons_dir.glob(f"chrome-{self.name}.*png")
+                      if pattern.fullmatch(p.name))
 
 
 def write_file(path, data):
@@ -173,15 +196,33 @@ def png_bytes(image):
     return buf.getvalue()
 
 
-def refresh_icon_cache(inst):
-    """Make GNOME Shell reload the instance's icon after it was rewritten.
+def install_icon(inst, icon):
+    """Write icon (PNG bytes) to the instance's icons dir under its
+    content-based name (see Instance.icon_path) and return that path. The
+    launcher still needs to point at it; remove_old_icons then cleans up."""
+    path = inst.icon_path(icon)
+    inst.icons_dir.mkdir(parents=True, exist_ok=True)
+    write_file(path, icon)
+    return path
 
-    GNOME Shell caches icons by path and doesn't watch the icon files, so an
-    icon rewritten in place would stay stale until logout. It does rescan icon
-    directories whose modification time changed, which also drops the cached
-    icons, so bump the directory's.
-    """
-    os.utime(inst.icon_file.parent)
+
+def remove_old_icons(inst, keep):
+    """Delete the instance's icon files other than keep, the one its
+    launcher now uses."""
+    for path in inst.icon_files():
+        if path != keep:
+            path.unlink(missing_ok=True)
+
+
+def set_launcher_icon(desktop_file, icon_path):
+    """Point an existing launcher's Icon= line at icon_path, leaving the rest
+    of the file as it is."""
+    text = desktop_file.read_text()
+    line = f"Icon={entry_string(str(icon_path))}"
+    text, count = re.subn(r"^Icon=.*$", lambda _: line, text, count=1, flags=re.MULTILINE)
+    if not count:
+        text = text.replace("[Desktop Entry]\n", f"[Desktop Entry]\n{line}\n", 1)
+    write_file(desktop_file, text.encode())
 
 
 def update_desktop_database(inst):
@@ -415,7 +456,7 @@ def entry_string(s):
             .replace("\t", "\\t").replace("\r", "\\r"))
 
 
-def desktop_entry(inst, label, chrome_bin):
+def desktop_entry(inst, label, chrome_bin, icon_path):
     """The launcher file's contents for the instance, shown in menus as
     "Chrome - label".
 
@@ -441,7 +482,7 @@ Name=Chrome - {label}
 GenericName=Web Browser
 Comment=Google Chrome ({label} profile)
 Exec={cmd} %U
-Icon={entry_string(str(inst.icon_file))}
+Icon={entry_string(str(icon_path))}
 Terminal=false
 Categories=Network;WebBrowser;
 StartupNotify=true
@@ -790,7 +831,7 @@ def delete(inst):
     if inst.chrome_running():
         die(f"Chrome is running with {inst.profile_dir}; close it first.")
     found = False
-    for target in (inst.desktop_file, inst.icon_file, inst.profile_dir, inst.cache_dir):
+    for target in (inst.desktop_file, *inst.icon_files(), inst.profile_dir, inst.cache_dir):
         if not os.path.lexists(target):
             continue
         found = True
@@ -826,24 +867,22 @@ def recolor(inst, logo):
         icon, desc = theme_icon(inst, logo)
     except (NoThemeColor, ValueError) as err:
         die(err)
-    inst.icon_file.parent.mkdir(parents=True, exist_ok=True)
-    write_file(inst.icon_file, icon)
-    refresh_icon_cache(inst)
-    print(f"Icon:      {inst.icon_file} ({desc})")
-    print("The dock picks it up within a few seconds (or when you open the overview).")
+    icon_path = install_icon(inst, icon)
+    set_launcher_icon(inst.desktop_file, icon_path)
+    remove_old_icons(inst, icon_path)
+    print(f"Icon:      {icon_path} ({desc})")
 
 
 def create(inst, label, icon_src, force, chrome_bin, logo):
     """The default command: write the instance's launcher and icon, creating
     its data dir if needed. An existing data dir is reused as-is, logins and
-    all. Without force, refuses to overwrite an existing launcher or icon.
+    all. Without force, refuses to overwrite an existing launcher.
     """
     # Check everything, and build the icon, before creating anything, so a bad
     # option or unreadable image leaves no debris.
     if not force:
-        for f in (inst.desktop_file, inst.icon_file):
-            if os.path.lexists(f):
-                die(f"{f} already exists (use --force to overwrite)")
+        if os.path.lexists(inst.desktop_file):
+            die(f"{inst.desktop_file} already exists (use --force to overwrite)")
     if not (os.path.isfile(chrome_bin) and os.access(chrome_bin, os.X_OK)):
         die(f"Chrome not found at {chrome_bin} (set CHROME_BIN)")
     if icon_src:
@@ -871,7 +910,7 @@ def create(inst, label, icon_src, force, chrome_bin, logo):
     if icon is None:
         icon, icon_desc = Path(logo).read_bytes(), "stock Chrome logo"
 
-    for d in (inst.profile_dir, inst.desktop_file.parent, inst.icon_file.parent):
+    for d in (inst.profile_dir, inst.desktop_file.parent):
         d.mkdir(parents=True, exist_ok=True)
 
     # A brand-new data dir gets its profile folder named NAME instead of
@@ -883,13 +922,13 @@ def create(inst, label, icon_src, force, chrome_bin, logo):
         local_state = json.dumps({"profile": {"last_used": inst.name}}, separators=(",", ":"))
         write_file(inst.profile_dir / "Local State", (local_state + "\n").encode())
 
-    write_file(inst.icon_file, icon)
-    write_file(inst.desktop_file, desktop_entry(inst, label, chrome_bin).encode())
-    refresh_icon_cache(inst)
+    icon_path = install_icon(inst, icon)
+    write_file(inst.desktop_file, desktop_entry(inst, label, chrome_bin, icon_path).encode())
+    remove_old_icons(inst, icon_path)
     update_desktop_database(inst)
 
     print(f"Launcher:  {inst.desktop_file}")
-    print(f"Icon:      {inst.icon_file} ({icon_desc})")
+    print(f"Icon:      {icon_path} ({icon_desc})")
     if fresh:
         print(f'Data dir:  {inst.profile_dir} (new; profile folder "{inst.name}")')
         print("Launch it from your app menu and sign in. To match the icon to a theme")
@@ -923,7 +962,7 @@ def parse_args():
                         help="only redraw NAME's icon in the theme color picked in that "
                              "Chrome (Customize Chrome > Color)")
     parser.add_argument("-f", "--force", action="store_true",
-                        help="overwrite an existing launcher/icon (data dir is kept)")
+                        help="overwrite an existing launcher and icon (data dir is kept)")
     parser.add_argument("-d", "--delete", action="store_true",
                         help="remove NAME's launcher, icon and data dir, confirming each")
     parser.add_argument("-l", "--list", action="store_true",

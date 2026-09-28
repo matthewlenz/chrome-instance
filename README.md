@@ -224,7 +224,7 @@ For `NAME=work`:
 | `~/.config/chrome-instances/work/` | Chrome `--user-data-dir` (starts empty apart from a one-line `Local State`) |
 | `~/.cache/chrome-instances/work/` | Chrome's disk cache for it, created by Chrome |
 | `~/.local/share/applications/chrome-work.desktop` | The launcher |
-| `~/.local/share/icons/chrome-work.png` | The launcher icon |
+| `~/.local/share/icons/chrome-work.<hash>.png` | The launcher icon, named after a hash of the image (see [Menu refresh](#menu-refresh)) |
 
 Paths follow `$XDG_CONFIG_HOME`, `$XDG_CACHE_HOME` and `$XDG_DATA_HOME` if set.
 
@@ -249,7 +249,7 @@ Name=Chrome - work
 GenericName=Web Browser
 Comment=Google Chrome (work profile)
 Exec=env CHROME_DESKTOP=chrome-work.desktop /usr/bin/google-chrome-stable --user-data-dir=/home/USER/.config/chrome-instances/work --class=chrome-work %U
-Icon=/home/USER/.local/share/icons/chrome-work.png
+Icon=/home/USER/.local/share/icons/chrome-work.1a2b3c4d.png
 Terminal=false
 Categories=Network;WebBrowser;
 StartupNotify=true
@@ -341,8 +341,9 @@ again whenever you change the color.
   `--recolor` still draws the icon but prints a note.
 - Chrome saves a color change to disk within a few seconds; if `--recolor`
   still sees the old color, run it again.
-- The dock shows the new icon within a few seconds, or as soon as you open
-  the overview (see [Menu refresh](#menu-refresh)).
+- The dash/dock shows the new icon right away; the overview's app grid and
+  the app menu may keep showing the old one for a while (see
+  [Menu refresh](#menu-refresh)).
 
 `--force` on an existing data directory also uses its theme color when it has
 one; otherwise it uses the stock logo.
@@ -421,12 +422,20 @@ runs `update-desktop-database` (when installed) to refresh the MIME cache so
 each launcher appears correctly under "Open With" and in default-browser
 settings.
 
-Icons are harder: GNOME Shell caches them by path and doesn't watch the icon
-files, so an icon rewritten in place (`--recolor`, `-f`) would stay stale until
-you log out. It does notice when an icon directory's modification time changes,
-and then reloads its icons, so after writing an icon `chrome-instance` touches
-`~/.local/share/icons`. The dock (including Dash to Panel) updates within a
-few seconds, or as soon as the overview is opened.
+Icons are harder: GNOME Shell caches icon images by file name, and icons
+already on screen (the dash, the overview's app grid) don't redraw when their
+file changes. An icon rewritten in place took around five minutes to show up
+in testing, and only newly added dash entries showed it sooner.
+
+So `chrome-instance` never rewrites an icon in place. Each icon is named after
+a hash of the image (`chrome-NAME.1a2b3c4d.png`); a new image (`--recolor`,
+`-f`, `--icon`) gets a new file, the launcher's `Icon=` is pointed at it, and
+the old file is deleted. GNOME sees the launcher change and reloads the app.
+In testing, Dash to Dock then showed the new icon immediately, but the
+overview's app grid and the app menu kept the old one for a while (they
+catch up eventually, and at the latest after logging out and back in). Icons
+from older versions (`chrome-NAME.png`) are replaced the same way the next
+time they're written.
 
 ## Upgrade and uninstall
 
