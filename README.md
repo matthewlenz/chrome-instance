@@ -30,6 +30,7 @@ Not affiliated with or endorsed by Google.
 - [Upgrade and uninstall](#upgrade-and-uninstall)
 - [Development](#development)
 - [TODO](#todo)
+- [License](#license)
 
 ## Why
 
@@ -459,3 +460,8 @@ inconclusive either way.
 - Consider adding `--no-default-browser-check` to the instances' `Exec=` so
   they don't keep prompting.
 - Update the "Key points" section above either way.
+
+## License
+
+[MIT](LICENSE): use, modify and share it however you like, as long as the
+copyright notice stays with copies of the code. It comes with no warranty.
